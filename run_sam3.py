@@ -16,6 +16,14 @@ TABLE_OUTPUT = OUTPUT_DIR / "sam3_table_only.jpg"
 BOX_OUTPUT = OUTPUT_DIR / "sam3_boxes_only.jpg"
 LEFT_GRIPPER_OUTPUT = OUTPUT_DIR / "sam3_left_gripper_only.jpg"
 RIGHT_GRIPPER_OUTPUT = OUTPUT_DIR / "sam3_right_gripper_only.jpg"
+TABLE_POLYGON_RATIO = (
+    (0.00, 0.42),
+    (1.00, 0.42),
+    (1.00, 0.72),
+    (0.76, 0.93),
+    (0.24, 0.93),
+    (0.00, 0.72),
+)
 
 
 def resolve_model_path(candidates=MODEL_CANDIDATES) -> Path:
@@ -81,6 +89,35 @@ def merge_result_masks(results, height: int, width: int) -> np.ndarray:
     return merged
 
 
+def build_table_roi_mask(
+    height: int,
+    width: int,
+    polygon_ratio=TABLE_POLYGON_RATIO,
+) -> np.ndarray:
+    polygon = np.array(
+        [
+            [
+                int(round(float(x_ratio) * (width - 1))),
+                int(round(float(y_ratio) * (height - 1))),
+            ]
+            for x_ratio, y_ratio in polygon_ratio
+        ],
+        dtype=np.int32,
+    )
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 1)
+    return mask
+
+
+def remove_protected_regions(
+    roi_mask: np.ndarray,
+    protected_mask: np.ndarray,
+) -> np.ndarray:
+    table_mask = roi_mask.copy()
+    table_mask[protected_mask > 0] = 0
+    return table_mask
+
+
 def predict_gripper(model: SAM, image_path: Path, point: list[int], device: str):
     return model.predict(
         source=str(image_path),
@@ -125,9 +162,8 @@ def main() -> None:
         model, IMAGE_PATH, right_gripper_point, device
     )
 
-    print("正在通过非目标减法计算桌面候选掩码...")
-    total_workspace_mask = np.zeros((height, width), dtype=np.uint8)
-    total_workspace_mask[250:height, :] = 1
+    print("正在通过桌面多边形 ROI 和非目标减法计算桌面候选掩码...")
+    table_roi_mask = build_table_roi_mask(height, width)
 
     protected_mask = merge_result_masks(box_results, height, width)
     protected_mask = np.maximum(
@@ -138,10 +174,10 @@ def main() -> None:
         protected_mask,
         merge_result_masks(right_gripper_results, height, width),
     )
-    total_workspace_mask[protected_mask > 0] = 0
+    table_mask = remove_protected_regions(table_roi_mask, protected_mask)
 
     table_output = img.copy()
-    table_output[total_workspace_mask == 1] = [255, 0, 0]
+    table_output[table_mask == 1] = [255, 0, 0]
     cv2.addWeighted(table_output, 0.4, img, 0.6, 0, table_output)
 
     cv2.imwrite(str(TABLE_OUTPUT), table_output)
