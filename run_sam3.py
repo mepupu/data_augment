@@ -99,7 +99,6 @@ def predict_semantic_results(
             "mode": "predict",
             "model": str(model_path),
             "device": device,
-            "quantize": 16,
             "verbose": False,
         }
     )
