@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -267,6 +269,68 @@ class RunSam3HelperTests(unittest.TestCase):
         self.assertEqual(table_mask[0, 0], 1)
         self.assertEqual(table_mask[1, 1], 0)
         self.assertEqual(table_mask[2, 2], 0)
+
+    def test_default_scene_config_keeps_current_objects_and_composite(self):
+        config = run_sam3.default_scene_config()
+
+        object_names = [item["name"] for item in config["objects"]]
+        self.assertEqual(object_names, ["table", "bins", "grippers"])
+        self.assertEqual(config["composites"][0]["base"], "table")
+        self.assertEqual(config["composites"][0]["subtract"], ["bins", "grippers"])
+        self.assertEqual(config["composites"][0]["output"], "sam3_table_only.jpg")
+
+    def test_load_scene_config_reads_json_file(self):
+        payload = {
+            "image_path": "/tmp/frame.jpg",
+            "output_dir": "/tmp/out",
+            "objects": [
+                {
+                    "name": "shelf",
+                    "prompts": ["storage rack", "metal shelf"],
+                    "output": "shelf.jpg",
+                }
+            ],
+            "composites": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "scene.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            config = run_sam3.load_scene_config(config_path)
+
+        self.assertEqual(config["image_path"], "/tmp/frame.jpg")
+        self.assertEqual(config["objects"][0]["name"], "shelf")
+        self.assertEqual(config["model_candidates"], [str(path) for path in run_sam3.MODEL_CANDIDATES])
+
+    def test_build_composite_mask_subtracts_named_masks(self):
+        masks = {
+            "table": np.ones((3, 3), dtype=np.uint8),
+            "bins": np.array(
+                [
+                    [0, 1, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                ],
+                dtype=np.uint8,
+            ),
+            "grippers": np.array(
+                [
+                    [0, 0, 0],
+                    [0, 1, 0],
+                    [0, 0, 0],
+                ],
+                dtype=np.uint8,
+            ),
+        }
+
+        composite = run_sam3.build_composite_mask(
+            {"base": "table", "subtract": ["bins", "grippers"]}, masks
+        )
+
+        self.assertEqual(composite[0, 1], 0)
+        self.assertEqual(composite[1, 1], 0)
+        self.assertEqual(composite[2, 2], 1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,49 @@
+{
+  "model_candidates": [
+    "/root/autodl-fs/sam3.pt",
+    "/root/sam3/sam3.pt"
+  ],
+  "image_path": "/root/autodl-fs/datasets/head_first_frame.jpg",
+  "output_dir": "/root/autodl-fs",
+  "objects": [
+    {
+      "name": "table",
+      "prompts": [
+        "tabletop",
+        "table surface",
+        "white table surface"
+      ]
+    },
+    {
+      "name": "bins",
+      "prompts": [
+        "yellow plastic bin",
+        "yellow storage box",
+        "yellow container",
+        "yellow material box"
+      ],
+      "output": "sam3_boxes_only.jpg"
+    },
+    {
+      "name": "grippers",
+      "prompts": [
+        "robot gripper",
+        "robot end effector",
+        "black robot gripper",
+        "robot clamp"
+      ],
+      "output": "sam3_grippers_only.jpg"
+    }
+  ],
+  "composites": [
+    {
+      "name": "table_background",
+      "base": "table",
+      "subtract": [
+        "bins",
+        "grippers"
+      ],
+      "output": "sam3_table_only.jpg"
+    }
+  ]
+}

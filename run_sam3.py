@@ -1,3 +1,5 @@
+import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -33,6 +35,52 @@ GRIPPER_TEXT_PROMPTS = (
     "black robot gripper",
     "robot clamp",
 )
+
+
+def default_scene_config() -> dict:
+    return {
+        "model_candidates": [str(path) for path in MODEL_CANDIDATES],
+        "image_path": str(IMAGE_PATH),
+        "output_dir": str(OUTPUT_DIR),
+        "objects": [
+            {
+                "name": "table",
+                "prompts": list(TABLE_TEXT_PROMPTS),
+            },
+            {
+                "name": "bins",
+                "prompts": list(BIN_TEXT_PROMPTS),
+                "output": BOX_OUTPUT.name,
+            },
+            {
+                "name": "grippers",
+                "prompts": list(GRIPPER_TEXT_PROMPTS),
+                "output": GRIPPER_OUTPUT.name,
+            },
+        ],
+        "composites": [
+            {
+                "name": "table_background",
+                "base": "table",
+                "subtract": ["bins", "grippers"],
+                "output": TABLE_OUTPUT.name,
+            }
+        ],
+    }
+
+
+def load_scene_config(config_path: Path | None = None) -> dict:
+    if config_path is None:
+        return default_scene_config()
+
+    with Path(config_path).expanduser().open("r", encoding="utf-8") as fh:
+        config = json.load(fh)
+    config.setdefault("model_candidates", [str(path) for path in MODEL_CANDIDATES])
+    config.setdefault("image_path", str(IMAGE_PATH))
+    config.setdefault("output_dir", str(OUTPUT_DIR))
+    config.setdefault("objects", [])
+    config.setdefault("composites", [])
+    return config
 
 
 def resolve_model_path(candidates=MODEL_CANDIDATES) -> Path:
@@ -231,54 +279,93 @@ def remove_protected_regions(
     return table_mask
 
 
+def build_composite_mask(composite: dict, masks: dict[str, np.ndarray]) -> np.ndarray:
+    base_name = composite["base"]
+    if base_name not in masks:
+        raise KeyError(f"composite base mask not found: {base_name}")
+
+    protected = np.zeros_like(masks[base_name], dtype=np.uint8)
+    for name in composite.get("subtract", []):
+        if name not in masks:
+            raise KeyError(f"composite subtract mask not found: {name}")
+        protected = np.maximum(protected, masks[name])
+    return remove_protected_regions(masks[base_name], protected)
+
+
 def save_results(results, filename: Path) -> None:
     for result in results:
         result.save(filename=str(filename))
 
 
-def main() -> None:
+def save_mask_overlay(img: np.ndarray, mask: np.ndarray, filename: Path) -> None:
+    output = img.copy()
+    output[mask == 1] = [255, 0, 0]
+    cv2.addWeighted(output, 0.4, img, 0.6, 0, output)
+    cv2.imwrite(str(filename), output)
+
+
+def run_scene_config(config: dict) -> dict[str, Path]:
     device = resolve_device()
-    model_path = resolve_model_path()
+    model_candidates = [Path(path) for path in config.get("model_candidates", MODEL_CANDIDATES)]
+    model_path = resolve_model_path(model_candidates)
     print(f"SAM 3 模型加载成功: {model_path}")
 
-    img = load_image(IMAGE_PATH)
+    image_path = Path(config["image_path"]).expanduser()
+    output_dir = Path(config["output_dir"]).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    img = load_image(image_path)
     height, width, _ = img.shape
+    masks: dict[str, np.ndarray] = {}
+    outputs: dict[str, Path] = {}
 
-    print("正在通过 SAM3 文本提示词分割桌面区域...")
-    table_results = predict_table_surface_results(model_path, IMAGE_PATH, device=device)
-    table_surface_mask = merge_result_masks(table_results, height, width)
-    require_nonempty_mask(table_surface_mask, "桌面")
+    for obj in config["objects"]:
+        name = obj["name"]
+        prompts = tuple(obj["prompts"])
+        print(f"正在通过 SAM3 文本提示词分割 {name}...")
+        results = predict_semantic_results(model_path, image_path, prompts=prompts, device=device)
+        mask = merge_result_masks(results, height, width)
+        if obj.get("required", True):
+            require_nonempty_mask(mask, name)
+        masks[name] = mask
 
-    print("正在通过 SAM3 文本提示词分割黄色物料盒...")
-    box_results = predict_semantic_results(
-        model_path, IMAGE_PATH, prompts=BIN_TEXT_PROMPTS, device=device
+        if obj.get("output"):
+            output_path = output_dir / obj["output"]
+            save_results(results, output_path)
+            outputs[name] = output_path
+
+    for composite in config.get("composites", []):
+        name = composite["name"]
+        print(f"正在生成组合掩码 {name}...")
+        mask = build_composite_mask(composite, masks)
+        if composite.get("required", True):
+            require_nonempty_mask(mask, name)
+        output_path = output_dir / composite["output"]
+        save_mask_overlay(img, mask, output_path)
+        outputs[name] = output_path
+
+    print("\nSAM3 场景分割完成")
+    print("生成的文件包括：")
+    for index, (name, path) in enumerate(outputs.items(), start=1):
+        print(f"  - {index}. {name}: {path}")
+    return outputs
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run configurable SAM3 semantic segmentation.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="JSON scene config. Defaults to the built-in table/bins/grippers scene.",
     )
-    box_mask = merge_result_masks(box_results, height, width)
-    require_nonempty_mask(box_mask, "物料盒")
+    return parser.parse_args(argv)
 
-    print("正在通过 SAM3 文本提示词分割机器人夹爪...")
-    gripper_results = predict_semantic_results(
-        model_path, IMAGE_PATH, prompts=GRIPPER_TEXT_PROMPTS, device=device
-    )
-    gripper_mask = merge_result_masks(gripper_results, height, width)
-    require_nonempty_mask(gripper_mask, "夹爪")
 
-    protected_mask = np.maximum(box_mask, gripper_mask)
-    table_mask = remove_protected_regions(table_surface_mask, protected_mask)
-
-    table_output = img.copy()
-    table_output[table_mask == 1] = [255, 0, 0]
-    cv2.addWeighted(table_output, 0.4, img, 0.6, 0, table_output)
-
-    cv2.imwrite(str(TABLE_OUTPUT), table_output)
-    save_results(box_results, BOX_OUTPUT)
-    save_results(gripper_results, GRIPPER_OUTPUT)
-
-    print("\n双臂机器人工作台全场景解耦分割完成")
-    print("生成的独立特征文件包括：")
-    print(f"  - 1. 物料盒区域:   {BOX_OUTPUT}")
-    print(f"  - 2. 夹爪区域:     {GRIPPER_OUTPUT}")
-    print(f"  - 3. 桌面候选背景: {TABLE_OUTPUT}")
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    config = load_scene_config(args.config)
+    run_scene_config(config)
 
 
 if __name__ == "__main__":
