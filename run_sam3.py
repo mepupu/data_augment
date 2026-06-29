@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
@@ -85,14 +86,7 @@ def normalize_results(results) -> list:
     return [results]
 
 
-def install_simple_tokenizer_call_patch(tokenizer_cls=None) -> bool:
-    if tokenizer_cls is None:
-        try:
-            from ultralytics.models.sam.sam3.text_encoder_ve import SimpleTokenizer
-        except ImportError:
-            return False
-        tokenizer_cls = SimpleTokenizer
-
+def _install_tokenizer_call_on_class(tokenizer_cls) -> bool:
     if "__call__" in getattr(tokenizer_cls, "__dict__", {}):
         return False
 
@@ -120,6 +114,60 @@ def install_simple_tokenizer_call_patch(tokenizer_cls=None) -> bool:
     return True
 
 
+def _patch_tokenizers_in_object(obj, seen: set[int] | None = None) -> int:
+    if obj is None:
+        return 0
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    patched = 0
+    obj_cls = type(obj)
+    if obj_cls.__name__ == "SimpleTokenizer" and hasattr(obj, "encode"):
+        patched += int(_install_tokenizer_call_on_class(obj_cls))
+
+    for name in ("model", "backbone", "language_backbone", "tokenizer"):
+        child = getattr(obj, name, None)
+        if child is not None:
+            patched += _patch_tokenizers_in_object(child, seen)
+    return patched
+
+
+def install_simple_tokenizer_call_patch(tokenizer_cls=None, root_obj=None) -> bool:
+    patched = 0
+    if tokenizer_cls is not None:
+        patched += int(_install_tokenizer_call_on_class(tokenizer_cls))
+    else:
+        try:
+            from ultralytics.models.sam.sam3.text_encoder_ve import SimpleTokenizer
+        except ImportError:
+            SimpleTokenizer = None
+        if SimpleTokenizer is not None:
+            patched += int(_install_tokenizer_call_on_class(SimpleTokenizer))
+
+        for module in list(sys.modules.values()):
+            candidate = getattr(module, "SimpleTokenizer", None)
+            if isinstance(candidate, type):
+                patched += int(_install_tokenizer_call_on_class(candidate))
+
+    patched += _patch_tokenizers_in_object(root_obj)
+    return patched > 0
+
+
+def raise_clip_install_error(exc: TypeError) -> None:
+    raise RuntimeError(
+        "SAM3 文本分割需要 Ultralytics 适配的 CLIP。当前环境里的 tokenizer "
+        "不兼容，导致 SimpleTokenizer 不可调用。\n\n"
+        "请在 AutoDL 的 ultra-sam3 环境中执行：\n"
+        "  pip uninstall clip -y\n"
+        "  pip install git+https://github.com/ultralytics/CLIP.git\n\n"
+        "然后重新运行：python run_sam3.py"
+    ) from exc
+
+
 def predict_semantic_results(
     model_path: Path,
     image_path: Path,
@@ -139,7 +187,19 @@ def predict_semantic_results(
         }
     )
     predictor.set_image(str(image_path))
-    return normalize_results(predictor(text=list(prompts)))
+    install_simple_tokenizer_call_patch(root_obj=predictor)
+    try:
+        return normalize_results(predictor(text=list(prompts)))
+    except TypeError as exc:
+        if "SimpleTokenizer" not in str(exc) or "not callable" not in str(exc):
+            raise
+        install_simple_tokenizer_call_patch(root_obj=predictor)
+        try:
+            return normalize_results(predictor(text=list(prompts)))
+        except TypeError as retry_exc:
+            if "SimpleTokenizer" not in str(retry_exc) or "not callable" not in str(retry_exc):
+                raise
+            raise_clip_install_error(retry_exc)
 
 
 def predict_table_surface_results(

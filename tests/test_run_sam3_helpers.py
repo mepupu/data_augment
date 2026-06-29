@@ -1,0 +1,273 @@
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+def resize_nearest(mask, size, interpolation=None):
+    width, height = size
+    y_idx = (np.arange(height) * mask.shape[0] / height).astype(int)
+    x_idx = (np.arange(width) * mask.shape[1] / width).astype(int)
+    return mask[y_idx[:, None], x_idx]
+
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "run_sam3.py"
+sys.modules.setdefault(
+    "cv2",
+    types.SimpleNamespace(
+        resize=resize_nearest,
+        INTER_NEAREST=0,
+    ),
+)
+sys.modules.setdefault(
+    "torch",
+    types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        long=np.int64,
+        tensor=lambda value, dtype=None: np.array(value, dtype=dtype),
+        zeros=lambda shape, dtype=None: np.zeros(shape, dtype=dtype),
+    ),
+)
+sys.modules.setdefault(
+    "ultralytics",
+    types.SimpleNamespace(SAM=object),
+)
+sys.modules.setdefault("ultralytics.models", types.SimpleNamespace())
+sys.modules.setdefault(
+    "ultralytics.models.sam",
+    types.SimpleNamespace(SAM3SemanticPredictor=object),
+)
+spec = importlib.util.spec_from_file_location("run_sam3", MODULE_PATH)
+run_sam3 = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(run_sam3)
+
+
+class RunSam3HelperTests(unittest.TestCase):
+    def test_resolve_model_path_requires_existing_file(self):
+        missing_a = Path("/tmp/missing-a.pt")
+        missing_b = Path("/tmp/missing-b.pt")
+
+        with self.assertRaises(FileNotFoundError) as ctx:
+            run_sam3.resolve_model_path([missing_a, missing_b])
+
+        self.assertIn(str(missing_a), str(ctx.exception))
+        self.assertIn(str(missing_b), str(ctx.exception))
+
+    def test_mask_to_image_shape_resizes_to_image_size(self):
+        mask = np.ones((2, 3), dtype=np.uint8)
+
+        resized = run_sam3.mask_to_image_shape(mask, height=4, width=6)
+
+        self.assertEqual(resized.shape, (4, 6))
+        self.assertEqual(resized.dtype, np.uint8)
+        self.assertEqual(resized.max(), 1)
+
+    def test_merge_result_masks_handles_multiple_results_and_resizes(self):
+        class FakeTensor:
+            def __init__(self, arr):
+                self.arr = arr
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self.arr
+
+        class FakeMasks:
+            def __init__(self, arrays):
+                self.data = [FakeTensor(arr) for arr in arrays]
+
+        class FakeResult:
+            def __init__(self, arrays):
+                self.masks = FakeMasks(arrays)
+
+        results = [
+            FakeResult([np.array([[1, 0], [0, 0]], dtype=np.uint8)]),
+            FakeResult([np.array([[0, 0], [0, 1]], dtype=np.uint8)]),
+        ]
+
+        merged = run_sam3.merge_result_masks(results, height=2, width=2)
+
+        self.assertEqual(merged.tolist(), [[1, 0], [0, 1]])
+
+    def test_predict_table_surface_results_uses_text_prompts(self):
+        class FakePredictor:
+            instances = []
+
+            def __init__(self, overrides):
+                self.overrides = overrides
+                self.image_path = None
+                self.text = None
+                FakePredictor.instances.append(self)
+
+            def set_image(self, image_path):
+                self.image_path = image_path
+
+            def __call__(self, text):
+                self.text = text
+                return ["table-result"]
+
+        results = run_sam3.predict_table_surface_results(
+            model_path=Path("/tmp/sam3.pt"),
+            image_path=Path("/tmp/frame.jpg"),
+            predictor_cls=FakePredictor,
+        )
+
+        predictor = FakePredictor.instances[0]
+        self.assertEqual(results, ["table-result"])
+        self.assertEqual(predictor.image_path, "/tmp/frame.jpg")
+        self.assertEqual(predictor.text, list(run_sam3.TABLE_TEXT_PROMPTS))
+        self.assertEqual(predictor.overrides["model"], "/tmp/sam3.pt")
+        self.assertEqual(predictor.overrides["task"], "segment")
+        self.assertEqual(predictor.overrides["device"], "cuda:0")
+        self.assertNotIn("quantize", predictor.overrides)
+
+    def test_predict_semantic_results_accepts_object_prompts(self):
+        class FakePredictor:
+            instances = []
+
+            def __init__(self, overrides):
+                self.overrides = overrides
+                self.image_path = None
+                self.text = None
+                FakePredictor.instances.append(self)
+
+            def set_image(self, image_path):
+                self.image_path = image_path
+
+            def __call__(self, text):
+                self.text = text
+                return ("semantic-result",)
+
+        results = run_sam3.predict_semantic_results(
+            model_path=Path("/tmp/sam3.pt"),
+            image_path=Path("/tmp/frame.jpg"),
+            prompts=("yellow plastic bin", "yellow storage box"),
+            predictor_cls=FakePredictor,
+            device="cuda:1",
+        )
+
+        predictor = FakePredictor.instances[0]
+        self.assertEqual(results, ["semantic-result"])
+        self.assertEqual(predictor.text, ["yellow plastic bin", "yellow storage box"])
+        self.assertEqual(predictor.overrides["device"], "cuda:1")
+
+    def test_prompt_sets_cover_table_bins_and_grippers(self):
+        self.assertIn("table surface", run_sam3.TABLE_TEXT_PROMPTS)
+        self.assertIn("yellow plastic bin", run_sam3.BIN_TEXT_PROMPTS)
+        self.assertIn("robot gripper", run_sam3.GRIPPER_TEXT_PROMPTS)
+
+    def test_install_simple_tokenizer_call_patch_adds_callable_encode_wrapper(self):
+        class FakeTokenizer:
+            encoder = {
+                "<|startoftext|>": 101,
+                "<|endoftext|>": 102,
+            }
+
+            def encode(self, text):
+                return [ord(char) for char in text]
+
+        patched = run_sam3.install_simple_tokenizer_call_patch(FakeTokenizer)
+        tokenizer = FakeTokenizer()
+        tokenized = tokenizer(["ab", "c"], context_length=5)
+
+        self.assertTrue(patched)
+        self.assertEqual(tokenized.tolist(), [[101, 97, 98, 102, 0], [101, 99, 102, 0, 0]])
+
+    def test_install_simple_tokenizer_call_patch_leaves_callable_class_unchanged(self):
+        class CallableTokenizer:
+            def __call__(self, text, context_length=77):
+                return text
+
+        patched = run_sam3.install_simple_tokenizer_call_patch(CallableTokenizer)
+
+        self.assertFalse(patched)
+
+    def test_install_simple_tokenizer_call_patch_finds_predictor_tokenizer(self):
+        class SimpleTokenizer:
+            encoder = {
+                "<|startoftext|>": 101,
+                "<|endoftext|>": 102,
+            }
+
+            def encode(self, text):
+                return [ord(char) for char in text]
+
+        predictor = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                backbone=types.SimpleNamespace(
+                    language_backbone=types.SimpleNamespace(tokenizer=SimpleTokenizer())
+                )
+            )
+        )
+
+        patched = run_sam3.install_simple_tokenizer_call_patch(root_obj=predictor)
+
+        self.assertTrue(patched)
+        self.assertTrue(callable(predictor.model.backbone.language_backbone.tokenizer))
+
+    def test_predict_semantic_results_explains_simple_tokenizer_type_error(self):
+        class SimpleTokenizer:
+            encoder = {
+                "<|startoftext|>": 101,
+                "<|endoftext|>": 102,
+            }
+
+            def encode(self, text):
+                return [ord(char) for char in text]
+
+        class FakePredictor:
+            calls = 0
+
+            def __init__(self, overrides):
+                self.model = types.SimpleNamespace(
+                    backbone=types.SimpleNamespace(
+                        language_backbone=types.SimpleNamespace(tokenizer=SimpleTokenizer())
+                    )
+                )
+
+            def set_image(self, image_path):
+                self.image_path = image_path
+
+            def __call__(self, text):
+                FakePredictor.calls += 1
+                raise TypeError("'SimpleTokenizer' object is not callable")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_sam3.predict_semantic_results(
+                model_path=Path("/tmp/sam3.pt"),
+                image_path=Path("/tmp/frame.jpg"),
+                predictor_cls=FakePredictor,
+                prompts=("table surface",),
+            )
+
+        self.assertEqual(FakePredictor.calls, 2)
+        self.assertIn("pip uninstall clip -y", str(ctx.exception))
+        self.assertIn("ultralytics/CLIP", str(ctx.exception))
+
+    def test_require_nonempty_mask_rejects_empty_table_mask(self):
+        empty = np.zeros((3, 3), dtype=np.uint8)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_sam3.require_nonempty_mask(empty, "桌面")
+
+        self.assertIn("桌面", str(ctx.exception))
+
+    def test_remove_protected_regions_keeps_only_roi_minus_objects(self):
+        roi_mask = np.ones((4, 4), dtype=np.uint8)
+        protected_mask = np.zeros((4, 4), dtype=np.uint8)
+        protected_mask[1:3, 1:3] = 1
+
+        table_mask = run_sam3.remove_protected_regions(roi_mask, protected_mask)
+
+        self.assertEqual(table_mask[0, 0], 1)
+        self.assertEqual(table_mask[1, 1], 0)
+        self.assertEqual(table_mask[2, 2], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
