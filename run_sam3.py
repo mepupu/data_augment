@@ -85,6 +85,41 @@ def normalize_results(results) -> list:
     return [results]
 
 
+def install_simple_tokenizer_call_patch(tokenizer_cls=None) -> bool:
+    if tokenizer_cls is None:
+        try:
+            from ultralytics.models.sam.sam3.text_encoder_ve import SimpleTokenizer
+        except ImportError:
+            return False
+        tokenizer_cls = SimpleTokenizer
+
+    if "__call__" in getattr(tokenizer_cls, "__dict__", {}):
+        return False
+
+    def __call__(self, text, context_length=77):
+        texts = [text] if isinstance(text, str) else list(text)
+        start_token = getattr(self, "encoder", {}).get("<|startoftext|>")
+        end_token = getattr(self, "encoder", {}).get("<|endoftext|>")
+        tokenized = torch.zeros((len(texts), context_length), dtype=torch.long)
+
+        for row, item in enumerate(texts):
+            tokens = []
+            if start_token is not None:
+                tokens.append(start_token)
+            tokens.extend(self.encode(item))
+            if end_token is not None:
+                tokens.append(end_token)
+            if len(tokens) > context_length:
+                tokens = tokens[:context_length]
+                if end_token is not None:
+                    tokens[-1] = end_token
+            tokenized[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+        return tokenized
+
+    tokenizer_cls.__call__ = __call__
+    return True
+
+
 def predict_semantic_results(
     model_path: Path,
     image_path: Path,
@@ -92,6 +127,7 @@ def predict_semantic_results(
     prompts: tuple[str, ...] = TABLE_TEXT_PROMPTS,
     device: str = "cuda:0",
 ) -> list:
+    install_simple_tokenizer_call_patch()
     predictor = predictor_cls(
         overrides={
             "conf": 0.25,
