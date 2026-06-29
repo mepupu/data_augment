@@ -3,7 +3,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from ultralytics import SAM
+from ultralytics.models.sam import SAM3SemanticPredictor
 
 
 MODEL_CANDIDATES = (
@@ -14,15 +14,23 @@ IMAGE_PATH = Path("/root/autodl-fs/datasets/head_first_frame.jpg")
 OUTPUT_DIR = Path("/root/autodl-fs")
 TABLE_OUTPUT = OUTPUT_DIR / "sam3_table_only.jpg"
 BOX_OUTPUT = OUTPUT_DIR / "sam3_boxes_only.jpg"
-LEFT_GRIPPER_OUTPUT = OUTPUT_DIR / "sam3_left_gripper_only.jpg"
-RIGHT_GRIPPER_OUTPUT = OUTPUT_DIR / "sam3_right_gripper_only.jpg"
-TABLE_POLYGON_RATIO = (
-    (0.00, 0.42),
-    (1.00, 0.42),
-    (1.00, 0.72),
-    (0.76, 0.93),
-    (0.24, 0.93),
-    (0.00, 0.72),
+GRIPPER_OUTPUT = OUTPUT_DIR / "sam3_grippers_only.jpg"
+TABLE_TEXT_PROMPTS = (
+    "tabletop",
+    "table surface",
+    "white table surface",
+)
+BIN_TEXT_PROMPTS = (
+    "yellow plastic bin",
+    "yellow storage box",
+    "yellow container",
+    "yellow material box",
+)
+GRIPPER_TEXT_PROMPTS = (
+    "robot gripper",
+    "robot end effector",
+    "black robot gripper",
+    "robot clamp",
 )
 
 
@@ -41,33 +49,11 @@ def resolve_device() -> str:
     return "cuda:0"
 
 
-def require_prompt_bboxes(prompt_bboxes: list[list[int]]) -> None:
-    if not prompt_bboxes:
-        raise RuntimeError("未通过 HSV 找到黄色物料盒框，请检查阈值或输入图像")
-
-
 def load_image(image_path: Path) -> np.ndarray:
     img = cv2.imread(str(image_path))
     if img is None:
         raise FileNotFoundError(f"未找到输入图片: {image_path}")
     return img
-
-
-def detect_yellow_bboxes(img: np.ndarray) -> list[list[int]]:
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([11, 40, 46])
-    upper_yellow = np.array([30, 255, 255])
-    yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
-    contours, _ = cv2.findContours(
-        yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    prompt_bboxes: list[list[int]] = []
-    for contour in contours:
-        if cv2.contourArea(contour) > 800:
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            prompt_bboxes.append([bx, by, bx + bw, by + bh])
-    return prompt_bboxes
 
 
 def mask_to_image_shape(mask: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -89,24 +75,56 @@ def merge_result_masks(results, height: int, width: int) -> np.ndarray:
     return merged
 
 
-def build_table_roi_mask(
-    height: int,
-    width: int,
-    polygon_ratio=TABLE_POLYGON_RATIO,
-) -> np.ndarray:
-    polygon = np.array(
-        [
-            [
-                int(round(float(x_ratio) * (width - 1))),
-                int(round(float(y_ratio) * (height - 1))),
-            ]
-            for x_ratio, y_ratio in polygon_ratio
-        ],
-        dtype=np.int32,
+def normalize_results(results) -> list:
+    if results is None:
+        return []
+    if isinstance(results, list):
+        return results
+    if isinstance(results, tuple):
+        return list(results)
+    return [results]
+
+
+def predict_semantic_results(
+    model_path: Path,
+    image_path: Path,
+    predictor_cls=SAM3SemanticPredictor,
+    prompts: tuple[str, ...] = TABLE_TEXT_PROMPTS,
+    device: str = "cuda:0",
+) -> list:
+    predictor = predictor_cls(
+        overrides={
+            "conf": 0.25,
+            "task": "segment",
+            "mode": "predict",
+            "model": str(model_path),
+            "device": device,
+            "quantize": 16,
+            "verbose": False,
+        }
     )
-    mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], 1)
-    return mask
+    predictor.set_image(str(image_path))
+    return normalize_results(predictor(text=list(prompts)))
+
+
+def predict_table_surface_results(
+    model_path: Path,
+    image_path: Path,
+    predictor_cls=SAM3SemanticPredictor,
+    device: str = "cuda:0",
+) -> list:
+    return predict_semantic_results(
+        model_path=model_path,
+        image_path=image_path,
+        predictor_cls=predictor_cls,
+        prompts=TABLE_TEXT_PROMPTS,
+        device=device,
+    )
+
+
+def require_nonempty_mask(mask: np.ndarray, name: str) -> None:
+    if not np.any(mask):
+        raise RuntimeError(f"未能分割出{name}区域，请检查 SAM3 文本提示词或输入图像")
 
 
 def remove_protected_regions(
@@ -118,16 +136,6 @@ def remove_protected_regions(
     return table_mask
 
 
-def predict_gripper(model: SAM, image_path: Path, point: list[int], device: str):
-    return model.predict(
-        source=str(image_path),
-        points=[point],
-        labels=[1],
-        device=device,
-        verbose=False,
-    )
-
-
 def save_results(results, filename: Path) -> None:
     for result in results:
         result.save(filename=str(filename))
@@ -136,45 +144,32 @@ def save_results(results, filename: Path) -> None:
 def main() -> None:
     device = resolve_device()
     model_path = resolve_model_path()
-    model = SAM(str(model_path))
     print(f"SAM 3 模型加载成功: {model_path}")
 
     img = load_image(IMAGE_PATH)
     height, width, _ = img.shape
 
-    prompt_bboxes = detect_yellow_bboxes(img)
-    require_prompt_bboxes(prompt_bboxes)
-    print(f"检测到 {len(prompt_bboxes)} 个黄色物料盒候选框")
+    print("正在通过 SAM3 文本提示词分割桌面区域...")
+    table_results = predict_table_surface_results(model_path, IMAGE_PATH, device=device)
+    table_surface_mask = merge_result_masks(table_results, height, width)
+    require_nonempty_mask(table_surface_mask, "桌面")
 
-    box_results = model.predict(
-        source=str(IMAGE_PATH),
-        bboxes=prompt_bboxes,
-        device=device,
-        verbose=False,
+    print("正在通过 SAM3 文本提示词分割黄色物料盒...")
+    box_results = predict_semantic_results(
+        model_path, IMAGE_PATH, prompts=BIN_TEXT_PROMPTS, device=device
     )
+    box_mask = merge_result_masks(box_results, height, width)
+    require_nonempty_mask(box_mask, "物料盒")
 
-    left_gripper_point = [int(width * 0.25), int(height * 0.85)]
-    right_gripper_point = [int(width * 0.78), int(height * 0.85)]
-    left_gripper_results = predict_gripper(
-        model, IMAGE_PATH, left_gripper_point, device
+    print("正在通过 SAM3 文本提示词分割机器人夹爪...")
+    gripper_results = predict_semantic_results(
+        model_path, IMAGE_PATH, prompts=GRIPPER_TEXT_PROMPTS, device=device
     )
-    right_gripper_results = predict_gripper(
-        model, IMAGE_PATH, right_gripper_point, device
-    )
+    gripper_mask = merge_result_masks(gripper_results, height, width)
+    require_nonempty_mask(gripper_mask, "夹爪")
 
-    print("正在通过桌面多边形 ROI 和非目标减法计算桌面候选掩码...")
-    table_roi_mask = build_table_roi_mask(height, width)
-
-    protected_mask = merge_result_masks(box_results, height, width)
-    protected_mask = np.maximum(
-        protected_mask,
-        merge_result_masks(left_gripper_results, height, width),
-    )
-    protected_mask = np.maximum(
-        protected_mask,
-        merge_result_masks(right_gripper_results, height, width),
-    )
-    table_mask = remove_protected_regions(table_roi_mask, protected_mask)
+    protected_mask = np.maximum(box_mask, gripper_mask)
+    table_mask = remove_protected_regions(table_surface_mask, protected_mask)
 
     table_output = img.copy()
     table_output[table_mask == 1] = [255, 0, 0]
@@ -182,15 +177,13 @@ def main() -> None:
 
     cv2.imwrite(str(TABLE_OUTPUT), table_output)
     save_results(box_results, BOX_OUTPUT)
-    save_results(left_gripper_results, LEFT_GRIPPER_OUTPUT)
-    save_results(right_gripper_results, RIGHT_GRIPPER_OUTPUT)
+    save_results(gripper_results, GRIPPER_OUTPUT)
 
     print("\n双臂机器人工作台全场景解耦分割完成")
     print("生成的独立特征文件包括：")
     print(f"  - 1. 物料盒区域:   {BOX_OUTPUT}")
-    print(f"  - 2. 左夹爪区域:   {LEFT_GRIPPER_OUTPUT}")
-    print(f"  - 3. 右夹爪区域:   {RIGHT_GRIPPER_OUTPUT}")
-    print(f"  - 4. 桌面候选背景: {TABLE_OUTPUT}")
+    print(f"  - 2. 夹爪区域:     {GRIPPER_OUTPUT}")
+    print(f"  - 3. 桌面候选背景: {TABLE_OUTPUT}")
 
 
 if __name__ == "__main__":
