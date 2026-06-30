@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -441,6 +442,37 @@ def can_decode_video(video_path: Path) -> bool:
         reader.close()
 
 
+def video_codec_name(video_path: Path) -> str | None:
+    command = [
+        ffmpeg_executable(),
+        "-hide_banner",
+        "-i",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+
+    output = "\n".join(part for part in (result.stderr, result.stdout) if part)
+    match = re.search(r"Video:\s*([^,\s]+)", output)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def codec_requires_transcode_for_sam3(codec_name: str | None) -> bool:
+    if not codec_name:
+        return False
+    return codec_name.lower() in {"av1", "av01"}
+
+
 def ffmpeg_executable() -> str:
     try:
         import imageio_ffmpeg
@@ -481,12 +513,15 @@ def prepare_video_for_sam3(
     config: dict,
     can_decode_video=can_decode_video,
     transcode_video=transcode_video_to_h264,
+    video_codec_name=video_codec_name,
 ) -> Path:
     mode = video_transcode_mode(config)
     if mode in ("false", "no", "off", "0", "none"):
         return video_path
-    if mode == "auto" and can_decode_video(video_path):
-        return video_path
+    if mode == "auto":
+        codec_name = video_codec_name(video_path)
+        if not codec_requires_transcode_for_sam3(codec_name) and can_decode_video(video_path):
+            return video_path
     if mode not in ("auto", "true", "yes", "on", "1", "always"):
         raise ValueError(f"unsupported transcode_input value: {config.get('transcode_input')}")
 

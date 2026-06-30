@@ -407,6 +407,28 @@ class RunSam3HelperTests(unittest.TestCase):
         self.assertEqual(prepared, Path("/tmp/sam3-cache/demo_h264.mp4"))
         self.assertEqual(calls, [(Path("/tmp/demo.mp4"), Path("/tmp/sam3-cache/demo_h264.mp4"))])
 
+    def test_prepare_video_for_sam3_transcodes_av1_even_when_imageio_probe_passes(self):
+        calls = []
+
+        def fake_transcode(source, target):
+            calls.append((source, target))
+            return target
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            prepared = run_sam3.prepare_video_for_sam3(
+                Path("/tmp/file-001.mp4"),
+                {"transcode_input": "auto", "transcode_dir": "/tmp/sam3-cache"},
+                can_decode_video=lambda path: True,
+                transcode_video=fake_transcode,
+                video_codec_name=lambda path: "av1",
+            )
+
+        self.assertEqual(prepared, Path("/tmp/sam3-cache/file-001_h264.mp4"))
+        self.assertEqual(
+            calls,
+            [(Path("/tmp/file-001.mp4"), Path("/tmp/sam3-cache/file-001_h264.mp4"))],
+        )
+
     def test_prepare_video_for_sam3_keeps_decodable_video_in_auto_mode(self):
         prepared = run_sam3.prepare_video_for_sam3(
             Path("/tmp/demo.mp4"),
