@@ -40,7 +40,7 @@ sys.modules.setdefault(
 sys.modules.setdefault("ultralytics.models", types.SimpleNamespace())
 sys.modules.setdefault(
     "ultralytics.models.sam",
-    types.SimpleNamespace(SAM3SemanticPredictor=object),
+    types.SimpleNamespace(SAM3SemanticPredictor=object, SAM3VideoSemanticPredictor=object),
 )
 spec = importlib.util.spec_from_file_location("run_sam3", MODULE_PATH)
 run_sam3 = importlib.util.module_from_spec(spec)
@@ -331,6 +331,53 @@ class RunSam3HelperTests(unittest.TestCase):
         self.assertEqual(composite[0, 1], 0)
         self.assertEqual(composite[1, 1], 0)
         self.assertEqual(composite[2, 2], 1)
+
+    def test_apply_color_overlay_changes_only_masked_pixels(self):
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        mask = np.array([[1, 0], [0, 0]], dtype=np.uint8)
+
+        output = run_sam3.apply_color_overlay(
+            frame, mask, color_bgr=(0, 0, 100), alpha=0.5
+        )
+
+        self.assertEqual(output[0, 0].tolist(), [0, 0, 50])
+        self.assertEqual(output[0, 1].tolist(), [0, 0, 0])
+
+    def test_predict_video_semantic_results_uses_official_video_predictor(self):
+        class FakeVideoPredictor:
+            instances = []
+
+            def __init__(self, overrides):
+                self.overrides = overrides
+                self.call_kwargs = None
+                FakeVideoPredictor.instances.append(self)
+
+            def __call__(self, **kwargs):
+                self.call_kwargs = kwargs
+                return ["video-result"]
+
+        results = run_sam3.predict_video_semantic_results(
+            model_path=Path("/tmp/sam3.pt"),
+            video_path=Path("/tmp/demo.mp4"),
+            prompts=("table surface",),
+            predictor_cls=FakeVideoPredictor,
+            device="cuda:2",
+        )
+
+        predictor = FakeVideoPredictor.instances[0]
+        self.assertEqual(results, ["video-result"])
+        self.assertEqual(predictor.overrides["model"], "/tmp/sam3.pt")
+        self.assertEqual(predictor.overrides["device"], "cuda:2")
+        self.assertEqual(predictor.call_kwargs["source"], "/tmp/demo.mp4")
+        self.assertEqual(predictor.call_kwargs["text"], ["table surface"])
+        self.assertTrue(predictor.call_kwargs["stream"])
+
+    def test_config_with_video_path_uses_video_mode(self):
+        image_config = {"image_path": "/tmp/frame.jpg"}
+        video_config = {"video_path": "/tmp/demo.mp4"}
+
+        self.assertFalse(run_sam3.is_video_config(image_config))
+        self.assertTrue(run_sam3.is_video_config(video_config))
 
 
 if __name__ == "__main__":

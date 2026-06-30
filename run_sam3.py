@@ -8,6 +8,11 @@ import numpy as np
 import torch
 from ultralytics.models.sam import SAM3SemanticPredictor
 
+try:
+    from ultralytics.models.sam import SAM3VideoSemanticPredictor
+except ImportError:
+    SAM3VideoSemanticPredictor = None
+
 
 MODEL_CANDIDATES = (
     Path("/root/autodl-fs/sam3.pt"),
@@ -265,6 +270,30 @@ def predict_table_surface_results(
     )
 
 
+def predict_video_semantic_results(
+    model_path: Path,
+    video_path: Path,
+    prompts: tuple[str, ...],
+    predictor_cls=SAM3VideoSemanticPredictor,
+    device: str = "cuda:0",
+):
+    if predictor_cls is None:
+        raise RuntimeError("当前 Ultralytics 环境不支持 SAM3VideoSemanticPredictor")
+    install_simple_tokenizer_call_patch()
+    predictor = predictor_cls(
+        overrides={
+            "conf": 0.25,
+            "task": "segment",
+            "mode": "predict",
+            "model": str(model_path),
+            "device": device,
+            "verbose": False,
+        }
+    )
+    install_simple_tokenizer_call_patch(root_obj=predictor)
+    return predictor(source=str(video_path), text=list(prompts), stream=True)
+
+
 def require_nonempty_mask(mask: np.ndarray, name: str) -> None:
     if not np.any(mask):
         raise RuntimeError(f"未能分割出{name}区域，请检查 SAM3 文本提示词或输入图像")
@@ -302,6 +331,123 @@ def save_mask_overlay(img: np.ndarray, mask: np.ndarray, filename: Path) -> None
     output[mask == 1] = [255, 0, 0]
     cv2.addWeighted(output, 0.4, img, 0.6, 0, output)
     cv2.imwrite(str(filename), output)
+
+
+def apply_color_overlay(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    alpha: float,
+) -> np.ndarray:
+    output = frame.copy()
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    color = np.array(color_bgr, dtype=np.float32)
+    selected = mask > 0
+    if np.any(selected):
+        blended = output[selected].astype(np.float32) * (1.0 - alpha) + color * alpha
+        output[selected] = np.clip(blended, 0, 255).astype(np.uint8)
+    return output
+
+
+def apply_video_effects(
+    frame: np.ndarray,
+    masks: dict[str, np.ndarray],
+    effects: list[dict],
+) -> np.ndarray:
+    output = frame
+    for effect in effects:
+        if effect.get("type") != "color_overlay":
+            raise ValueError(f"unsupported video effect type: {effect.get('type')}")
+        target = effect["target"]
+        if target not in masks:
+            raise KeyError(f"video effect target mask not found: {target}")
+        color = tuple(effect.get("color_bgr", effect.get("color", [255, 0, 0])))
+        output = apply_color_overlay(
+            output,
+            masks[target],
+            color_bgr=color,
+            alpha=effect.get("alpha", 0.45),
+        )
+    return output
+
+
+def get_video_fps(video_path: Path) -> float:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+    finally:
+        cap.release()
+    if not fps or fps <= 0:
+        return 30.0
+    return float(fps)
+
+
+def open_video_writer(output_path: Path, fps: float, width: int, height: int):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"无法打开视频输出文件: {output_path}")
+    return writer
+
+
+def is_video_config(config: dict) -> bool:
+    return bool(config.get("video_path"))
+
+
+def result_frame(result) -> np.ndarray:
+    frame = getattr(result, "orig_img", None)
+    if frame is None:
+        raise RuntimeError("SAM3 视频结果缺少 orig_img，无法写出处理后视频")
+    return frame.copy()
+
+
+def run_video_config(config: dict) -> Path:
+    device = resolve_device()
+    model_candidates = [Path(path) for path in config.get("model_candidates", MODEL_CANDIDATES)]
+    model_path = resolve_model_path(model_candidates)
+    print(f"SAM 3 模型加载成功: {model_path}")
+
+    video_path = Path(config["video_path"]).expanduser()
+    output_video = Path(config["output_video"]).expanduser()
+    objects = config.get("video_objects", config.get("objects", []))
+    if len(objects) != 1:
+        raise ValueError("video mode currently expects exactly one video object")
+    target = objects[0]
+    target_name = target["name"]
+    effects = config.get("effects", [])
+    if not effects:
+        raise ValueError("video mode requires at least one effect")
+
+    print(f"正在通过 SAM3 视频接口跟踪 {target_name}...")
+    results = predict_video_semantic_results(
+        model_path=model_path,
+        video_path=video_path,
+        prompts=tuple(target["prompts"]),
+        device=device,
+    )
+    fps = get_video_fps(video_path)
+    writer = None
+    frame_count = 0
+    try:
+        for result in results:
+            frame = result_frame(result)
+            height, width = frame.shape[:2]
+            if writer is None:
+                writer = open_video_writer(output_video, fps, width, height)
+            mask = merge_result_masks([result], height, width)
+            if target.get("required", True):
+                require_nonempty_mask(mask, target_name)
+            output = apply_video_effects(frame, {target_name: mask}, effects)
+            writer.write(output)
+            frame_count += 1
+    finally:
+        if writer is not None:
+            writer.release()
+    if frame_count == 0:
+        raise RuntimeError(f"视频没有产生可写出的帧: {video_path}")
+    print(f"\nSAM3 视频处理完成: {output_video}")
+    return output_video
 
 
 def run_scene_config(config: dict) -> dict[str, Path]:
@@ -365,7 +511,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = load_scene_config(args.config)
-    run_scene_config(config)
+    if is_video_config(config):
+        run_video_config(config)
+    else:
+        run_scene_config(config)
 
 
 if __name__ == "__main__":

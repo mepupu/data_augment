@@ -1,0 +1,30 @@
+{
+  "model_candidates": [
+    "/root/autodl-fs/sam3.pt",
+    "/root/sam3/sam3.pt"
+  ],
+  "video_path": "/root/autodl-fs/videos/input.mp4",
+  "output_video": "/root/autodl-fs/videos/table_recolor.mp4",
+  "video_objects": [
+    {
+      "name": "table",
+      "prompts": [
+        "tabletop",
+        "table surface",
+        "white table surface"
+      ]
+    }
+  ],
+  "effects": [
+    {
+      "target": "table",
+      "type": "color_overlay",
+      "color_bgr": [
+        255,
+        0,
+        0
+      ],
+      "alpha": 0.45
+    }
+  ]
+}
