@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import cv2
@@ -371,28 +372,138 @@ def apply_video_effects(
     return output
 
 
-def get_video_fps(video_path: Path) -> float:
-    cap = cv2.VideoCapture(str(video_path))
+def bgr_to_rgb_frame(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 3 and frame.shape[2] >= 3:
+        return frame[:, :, :3][:, :, ::-1]
+    return frame
+
+
+class ImageioVideoWriter:
+    def __init__(self, writer):
+        self.writer = writer
+
+    def write(self, frame: np.ndarray) -> None:
+        self.writer.append_data(bgr_to_rgb_frame(frame))
+
+    def release(self) -> None:
+        self.writer.close()
+
+
+def get_imageio_module():
+    import imageio.v2 as imageio
+
+    return imageio
+
+
+def get_video_fps(video_path: Path, imageio_module=None) -> float:
+    imageio = imageio_module or get_imageio_module()
+    reader = imageio.get_reader(str(video_path))
     try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        metadata = reader.get_meta_data()
+        fps = metadata.get("fps")
     finally:
-        cap.release()
+        reader.close()
     if not fps or fps <= 0:
         return 30.0
     return float(fps)
 
 
 def open_video_writer(output_path: Path, fps: float, width: int, height: int):
+    imageio = get_imageio_module()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"无法打开视频输出文件: {output_path}")
-    return writer
+    writer = imageio.get_writer(
+        str(output_path),
+        fps=fps,
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=1,
+    )
+    return ImageioVideoWriter(writer)
 
 
 def is_video_config(config: dict) -> bool:
     return bool(config.get("video_path"))
+
+
+def video_transcode_mode(config: dict) -> str:
+    return str(config.get("transcode_input", "auto")).lower()
+
+
+def can_decode_video(video_path: Path) -> bool:
+    imageio = get_imageio_module()
+    reader = imageio.get_reader(str(video_path))
+    try:
+        frame = reader.get_data(0)
+        return frame is not None
+    except Exception:
+        return False
+    finally:
+        reader.close()
+
+
+def ffmpeg_executable() -> str:
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        return "ffmpeg"
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def transcode_video_to_h264(source: Path, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_executable(),
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(target),
+    ]
+    try:
+        subprocess.run(command, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffmpeg，请安装 imageio-ffmpeg 或系统 ffmpeg") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"视频转码失败: {source} -> {target}") from exc
+    return target
+
+
+def prepare_video_for_sam3(
+    video_path: Path,
+    config: dict,
+    can_decode_video=can_decode_video,
+    transcode_video=transcode_video_to_h264,
+) -> Path:
+    mode = video_transcode_mode(config)
+    if mode in ("false", "no", "off", "0", "none"):
+        return video_path
+    if mode == "auto" and can_decode_video(video_path):
+        return video_path
+    if mode not in ("auto", "true", "yes", "on", "1", "always"):
+        raise ValueError(f"unsupported transcode_input value: {config.get('transcode_input')}")
+
+    transcode_dir = Path(config.get("transcode_dir", "/tmp/sam3_video_inputs")).expanduser()
+    target = transcode_dir / f"{video_path.stem}_h264.mp4"
+    print(f"输入视频可能无法被当前环境解码，正在转码为 H.264: {target}")
+    return transcode_video(video_path, target)
+
+
+def raise_zero_frame_video_error(video_path: Path) -> None:
+    raise RuntimeError(
+        f"视频没有产生可写出的帧: {video_path}\n"
+        "这通常是输入视频编码当前环境无法解码导致的，常见于 AV1/av01 视频。\n"
+        "可以先转为 H.264/yuv420p 再运行，例如：\n"
+        f"  ffmpeg -y -i {video_path} -map 0:v:0 -an -c:v libx264 -pix_fmt yuv420p /tmp/{video_path.stem}_h264.mp4\n"
+        "也可以在配置中保持默认 transcode_input=auto，让脚本自动转码。"
+    )
 
 
 def result_frame(result) -> np.ndarray:
@@ -408,7 +519,8 @@ def run_video_config(config: dict) -> Path:
     model_path = resolve_model_path(model_candidates)
     print(f"SAM 3 模型加载成功: {model_path}")
 
-    video_path = Path(config["video_path"]).expanduser()
+    original_video_path = Path(config["video_path"]).expanduser()
+    video_path = prepare_video_for_sam3(original_video_path, config)
     output_video = Path(config["output_video"]).expanduser()
     objects = config.get("video_objects", config.get("objects", []))
     if len(objects) != 1:
@@ -445,7 +557,7 @@ def run_video_config(config: dict) -> Path:
         if writer is not None:
             writer.release()
     if frame_count == 0:
-        raise RuntimeError(f"视频没有产生可写出的帧: {video_path}")
+        raise_zero_frame_video_error(original_video_path)
     print(f"\nSAM3 视频处理完成: {output_video}")
     return output_video
 

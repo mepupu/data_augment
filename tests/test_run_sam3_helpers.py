@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -378,6 +380,90 @@ class RunSam3HelperTests(unittest.TestCase):
 
         self.assertFalse(run_sam3.is_video_config(image_config))
         self.assertTrue(run_sam3.is_video_config(video_config))
+
+    def test_video_config_defaults_to_auto_transcode(self):
+        config = {"video_path": "/tmp/demo.mp4"}
+
+        self.assertEqual(run_sam3.video_transcode_mode(config), "auto")
+
+    def test_prepare_video_for_sam3_transcodes_when_probe_fails(self):
+        calls = []
+
+        def fake_can_decode(path):
+            return False
+
+        def fake_transcode(source, target):
+            calls.append((source, target))
+            return target
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            prepared = run_sam3.prepare_video_for_sam3(
+                Path("/tmp/demo.mp4"),
+                {"transcode_input": "auto", "transcode_dir": "/tmp/sam3-cache"},
+                can_decode_video=fake_can_decode,
+                transcode_video=fake_transcode,
+            )
+
+        self.assertEqual(prepared, Path("/tmp/sam3-cache/demo_h264.mp4"))
+        self.assertEqual(calls, [(Path("/tmp/demo.mp4"), Path("/tmp/sam3-cache/demo_h264.mp4"))])
+
+    def test_prepare_video_for_sam3_keeps_decodable_video_in_auto_mode(self):
+        prepared = run_sam3.prepare_video_for_sam3(
+            Path("/tmp/demo.mp4"),
+            {"transcode_input": "auto"},
+            can_decode_video=lambda path: True,
+            transcode_video=lambda source, target: target,
+        )
+
+        self.assertEqual(prepared, Path("/tmp/demo.mp4"))
+
+    def test_zero_frame_video_error_mentions_av1_transcode(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            run_sam3.raise_zero_frame_video_error(Path("/tmp/demo.mp4"))
+
+        self.assertIn("AV1", str(ctx.exception))
+        self.assertIn("ffmpeg", str(ctx.exception))
+
+    def test_bgr_to_rgb_frame_swaps_channels_for_imageio(self):
+        frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
+
+        rgb = run_sam3.bgr_to_rgb_frame(frame)
+
+        self.assertEqual(rgb.tolist(), [[[3, 2, 1]]])
+
+    def test_imageio_video_writer_appends_rgb_frames(self):
+        appended = []
+
+        class FakeWriter:
+            def append_data(self, frame):
+                appended.append(frame.copy())
+
+            def close(self):
+                appended.append("closed")
+
+        writer = run_sam3.ImageioVideoWriter(FakeWriter())
+        writer.write(np.array([[[1, 2, 3]]], dtype=np.uint8))
+        writer.release()
+
+        self.assertEqual(appended[0].tolist(), [[[3, 2, 1]]])
+        self.assertEqual(appended[1], "closed")
+
+    def test_get_video_fps_uses_imageio_metadata(self):
+        class FakeReader:
+            def get_meta_data(self):
+                return {"fps": 24}
+
+            def close(self):
+                pass
+
+        class FakeImageio:
+            @staticmethod
+            def get_reader(path):
+                return FakeReader()
+
+        fps = run_sam3.get_video_fps(Path("/tmp/demo.mp4"), imageio_module=FakeImageio)
+
+        self.assertEqual(fps, 24.0)
 
 
 if __name__ == "__main__":

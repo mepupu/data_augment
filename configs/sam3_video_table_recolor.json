@@ -5,6 +5,8 @@
   ],
   "video_path": "/root/autodl-fs/videos/input.mp4",
   "output_video": "/root/autodl-fs/videos/table_recolor.mp4",
+  "transcode_input": "auto",
+  "transcode_dir": "/tmp/sam3_video_inputs",
   "video_objects": [
     {
       "name": "table",
